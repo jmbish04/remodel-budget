@@ -1,3 +1,4 @@
+import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/cloudflare";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/cloudflare";
 import { Form, useLoaderData } from "@remix-run/react";
 import { Button } from "~/components/ui/button";
@@ -22,17 +23,53 @@ export async function action({ request, context }: ActionFunctionArgs) {
   const env = context.env as Env;
   const formData = await request.formData();
   const entries = Array.from(formData.entries());
+  
+  const errors: Record<string, string> = {};
 
   for (const [key, value] of entries) {
     if (!key.startsWith("bid-")) continue;
+
     const id = Number(key.replace("bid-", ""));
-    const bidValue = value ? Number(value) : null;
-    const timelineValue = formData.get(`timeline-${id}`);
-    const timeline = timelineValue ? Number(timelineValue) : null;
-    await updateRenovationBid(env.DB, id, bidValue, timeline);
+    const rawBidValue = value?.toString();
+    const rawTimelineValue = formData.get(`timeline-${id}`)?.toString();
+
+    // 1. Validate ID
+    if (isNaN(id)) continue;
+
+    // 2. Parse and Validate Bid
+    let bidValue: number | null = null;
+    if (rawBidValue && rawBidValue.trim() !== "") {
+      bidValue = Number(rawBidValue);
+      if (isNaN(bidValue) || bidValue < 0) {
+        errors[`bid-${id}`] = "Invalid bid amount";
+      }
+    }
+
+    // 3. Parse and Validate Timeline
+    let timeline: number | null = null;
+    if (rawTimelineValue && rawTimelineValue.trim() !== "") {
+      timeline = Number(rawTimelineValue);
+      if (isNaN(timeline) || timeline < 0 || timeline > 52) { // Example max: 1 year
+        errors[`timeline-${id}`] = "Invalid timeline (0-52 weeks)";
+      }
+    }
+
+    // 4. Update if no errors for this row
+    if (!errors[`bid-${id}`] && !errors[`timeline-${id}`]) {
+      try {
+        await updateRenovationBid(env.DB, id, bidValue, timeline);
+      } catch (e) {
+        errors[`db-${id}`] = "Failed to save to database";
+      }
+    }
   }
 
-  return { ok: true };
+  // Return errors if any occur, otherwise redirect or return success
+  if (Object.keys(errors).length > 0) {
+    return json({ ok: false, errors }, { status: 400 });
+  }
+
+  return json({ ok: true, errors: null });
 }
 
 export default function ContractorBid() {

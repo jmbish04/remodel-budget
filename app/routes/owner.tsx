@@ -1,4 +1,4 @@
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/cloudflare";
+import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/cloudflare";
 import { Form, useActionData, useLoaderData, useNavigation } from "@remix-run/react";
 import { useMemo } from "react";
 import {
@@ -29,15 +29,17 @@ import {
 } from "~/components/ui/table";
 import { getRenovationScope, updateAiRisk } from "~/utils/db.server";
 
-const promptText =
-  "Analyze these construction constraints for 126 Colby St (San Francisco). Flag high-risk timeline delays specifically regarding Section 311 and Variance.";
+const PROMPT_PREFIX = 
+  "Analyze this construction constraint for 126 Colby St (San Francisco). Flag high-risk timeline delays regarding Section 311 and Variance. Be concise.";
 
 type ActionData = {
   analysis?: string;
+  error?: string;
 };
 
 export async function loader({ context }: LoaderFunctionArgs) {
   const env = context.env as Env;
+  // Wrapped in try-catch in db.server.ts as previously discussed
   const scope = await getRenovationScope(env.DB);
   return { scope };
 }
@@ -46,43 +48,60 @@ export async function action({ request, context }: ActionFunctionArgs) {
   const env = context.env as Env;
   const formData = await request.formData();
   const selectedIds = formData.getAll("selected").map((id) => Number(id));
-  const scope = await getRenovationScope(env.DB);
-  const selected = scope.filter((item) => selectedIds.includes(item.id));
 
-  if (selected.length === 0) {
-    return { analysis: "Select at least one row to analyze." };
+  if (selectedIds.length === 0) {
+    return json<ActionData>({ error: "Select at least one row to analyze." }, { status: 400 });
   }
 
-  const combined = selected
-    .map(
-      (item) =>
-        `Item: ${item.item_name}\nCritical Constraint: ${item.critical_constraint}\nPermit Type: ${item.permit_type}`
-    )
-    .join("\n\n");
+  const scope = await getRenovationScope(env.DB);
+  const selectedItems = scope.filter((item) => selectedIds.includes(item.id));
 
-  const response = await env.AI.run("@cf/meta/llama-3-8b-instruct", {
-    prompt: `${promptText}\n\n${combined}`,
-    max_tokens: 256,
-  });
+  try {
+    // We process each item individually to ensure the AI risk assessment 
+    // is specific to that item's constraints.
+    const results = await Promise.all(
+      selectedItems.map(async (item) => {
+        try {
+          const response = await env.AI.run("@cf/meta/llama-3-8b-instruct", {
+            prompt: `${PROMPT_PREFIX}\n\nItem: ${item.item_name}\nConstraint: ${item.critical_constraint}\nPermit: ${item.permit_type}`,
+            max_tokens: 150,
+          });
 
-  const analysisText =
-    typeof response === "string"
-      ? response
-      : "result" in response
-        ? String(response.result)
-        : JSON.stringify(response);
+          // Clean handling of AI response types
+          let analysisText = "";
+          if (typeof response === "string") {
+            analysisText = response;
+          } else if (response && "result" in response) {
+            analysisText = String(response.result);
+          } else {
+            // Log full response for debugging, but save a clean error for user
+            console.error("Unexpected AI Response Format:", JSON.stringify(response));
+            analysisText = "Risk analysis temporarily unavailable for this item.";
+          }
 
-  await Promise.all(
-    selected.map((item) => updateAiRisk(env.DB, item.id, analysisText))
-  );
+          // Update the specific row in the database
+          await updateAiRisk(env.DB, item.id, analysisText);
+          return analysisText;
+        } catch (err) {
+          console.error(`AI Task Failed for ID ${item.id}:`, err);
+          return `Error analyzing ${item.item_name}.`;
+        }
+      })
+    );
 
-  return { analysis: analysisText } satisfies ActionData;
+    // Return the combined analysis for the UI Dialog
+    return json<ActionData>({ analysis: results.join("\n\n---\n\n") });
+  } catch (globalError) {
+    console.error("Action Function Critical Failure:", globalError);
+    return json<ActionData>({ error: "A critical error occurred during analysis." }, { status: 500 });
+  }
 }
 
 export default function OwnerDashboard() {
   const { scope } = useLoaderData<typeof loader>();
   const actionData = useActionData<ActionData>();
   const navigation = useNavigation();
+  const isSubmitting = navigation.state === "submitting";
 
   const chartData = useMemo(
     () =>
@@ -94,9 +113,8 @@ export default function OwnerDashboard() {
     [scope]
   );
 
-  const lastAnalysis =
-    actionData?.analysis ??
-    scope.find((item) => item.ai_risk_assessment)?.ai_risk_assessment;
+  // Fallback logic for the display modal
+  const displayAnalysis = actionData?.analysis || actionData?.error;
 
   return (
     <section className="space-y-6">
@@ -106,6 +124,7 @@ export default function OwnerDashboard() {
           Track ROI, bids, and AI risk analysis for each renovation item.
         </p>
       </div>
+
       <Form method="post" className="space-y-4">
         <Card>
           <CardHeader>
@@ -120,11 +139,9 @@ export default function OwnerDashboard() {
                   <TableHead>Category</TableHead>
                   <TableHead>Constraint</TableHead>
                   <TableHead>Permit</TableHead>
-                  <TableHead>Flags</TableHead>
                   <TableHead>Target</TableHead>
                   <TableHead>Value Add</TableHead>
                   <TableHead>Bid</TableHead>
-                  <TableHead>Timeline</TableHead>
                   <TableHead>ROI %</TableHead>
                 </TableRow>
               </TableHeader>
@@ -132,12 +149,8 @@ export default function OwnerDashboard() {
                 {scope.map((item) => {
                   const bid = item.contractor_bid ?? 0;
                   const roi = bid ? (item.est_value_add - bid) / bid : 0;
-                  const roiClass =
-                    roi > 1
-                      ? "text-emerald-400"
-                      : roi < 0
-                        ? "text-red-400"
-                        : "text-muted-foreground";
+                  const roiClass = roi > 1 ? "text-emerald-400" : roi < 0 ? "text-red-400" : "text-muted-foreground";
+                  
                   return (
                     <TableRow key={item.id}>
                       <TableCell>
@@ -150,17 +163,13 @@ export default function OwnerDashboard() {
                       </TableCell>
                       <TableCell className="font-medium">{item.item_name}</TableCell>
                       <TableCell>{item.category}</TableCell>
-                      <TableCell>{item.critical_constraint}</TableCell>
+                      <TableCell className="max-w-[200px] truncate" title={item.critical_constraint}>
+                        {item.critical_constraint}
+                      </TableCell>
                       <TableCell>{item.permit_type}</TableCell>
-                      <TableCell>{item.regulatory_flags}</TableCell>
                       <TableCell>${item.target_cost.toLocaleString()}</TableCell>
                       <TableCell>${item.est_value_add.toLocaleString()}</TableCell>
-                      <TableCell>
-                        {item.contractor_bid ? `$${item.contractor_bid.toLocaleString()}` : "-"}
-                      </TableCell>
-                      <TableCell>
-                        {item.timeline_weeks ? `${item.timeline_weeks} wks` : "-"}
-                      </TableCell>
+                      <TableCell>{bid ? `$${bid.toLocaleString()}` : "-"}</TableCell>
                       <TableCell className={roiClass}>
                         {bid ? `${Math.round(roi * 100)}%` : "-"}
                       </TableCell>
@@ -171,25 +180,26 @@ export default function OwnerDashboard() {
             </Table>
           </CardContent>
         </Card>
+
         <div className="flex items-center gap-3">
-          <Button type="submit" disabled={navigation.state === "submitting"}>
-            Analyze Risks
+          <Button type="submit" disabled={isSubmitting}>
+            {isSubmitting ? "Analyzing..." : "Analyze Selected Risks"}
           </Button>
-          <Dialog open={Boolean(actionData?.analysis) || navigation.state === "submitting"}>
-            <DialogContent>
+          
+          <Dialog open={Boolean(displayAnalysis) || isSubmitting}>
+            <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
               <DialogHeader>
-                <DialogTitle>AI Risk Assessment</DialogTitle>
+                <DialogTitle>{actionData?.error ? "Error" : "AI Risk Assessment"}</DialogTitle>
               </DialogHeader>
-              <p className="text-sm text-muted-foreground">
-                {navigation.state === "submitting"
-                  ? "Analyzing selected items..."
-                  : lastAnalysis ?? "Run analysis to see risk insights."}
-              </p>
+              <div className="text-sm leading-relaxed whitespace-pre-wrap">
+                {isSubmitting ? "Generating architectural risk insights..." : displayAnalysis}
+              </div>
             </DialogContent>
           </Dialog>
-          <Badge>ROI insights updated</Badge>
+          <Badge variant="outline">Cloudflare Workers AI (Llama 3)</Badge>
         </div>
       </Form>
+
       <Card>
         <CardHeader>
           <CardTitle>Target Cost vs. Actual Bid</CardTitle>
@@ -201,15 +211,10 @@ export default function OwnerDashboard() {
               <XAxis dataKey="name" stroke="#94a3b8" />
               <YAxis stroke="#94a3b8" />
               <Tooltip
-                contentStyle={{
-                  background: "#0f172a",
-                  border: "1px solid #1f2937",
-                  borderRadius: 8,
-                  color: "#e2e8f0",
-                }}
+                contentStyle={{ background: "#0f172a", border: "1px solid #1f2937", color: "#e2e8f0" }}
               />
-              <Bar dataKey="target" fill="#64748b" radius={[6, 6, 0, 0]} />
-              <Bar dataKey="bid" fill="#38bdf8" radius={[6, 6, 0, 0]} />
+              <Bar dataKey="target" fill="#64748b" radius={[6, 6, 0, 0]} name="Target Cost" />
+              <Bar dataKey="bid" fill="#38bdf8" radius={[6, 6, 0, 0]} name="Contractor Bid" />
             </BarChart>
           </ResponsiveContainer>
         </CardContent>
